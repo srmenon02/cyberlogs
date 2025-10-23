@@ -1,6 +1,4 @@
 import React, { useState } from "react";
-import LogsDashboard from "./components/LogsDashboard";
-import AnalyticsDashboard from "./components/AnalyticsDashboard";
 
 export default function App() {
   const [activeView, setActiveView] = useState("logs");
@@ -8,7 +6,7 @@ export default function App() {
   return (
     <div className="min-h-screen bg-charcoal-900">
       {/* Top Navigation Banner */}
-      <div className="px-8 py-4">
+      <div className="bg-charcoal-800 border-b border-charcoal-700 px-8 py-4">
         <div className="flex justify-end gap-3">
           <button
             onClick={() => setActiveView("logs")}

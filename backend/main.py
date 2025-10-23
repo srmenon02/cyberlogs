@@ -362,6 +362,240 @@ async def debug_env():
         "environment_vars": list(os.environ.keys())  # Just the keys, not values for security
     }
 
+# Add these imports at the top if not already present
+from datetime import timedelta
+
+# =================================================================
+# ANALYTICS ENDPOINTS - Add these before Kafka management endpoints
+# =================================================================
+
+@app.get("/logs/stats/by-level")
+async def get_stats_by_level():
+    """Get count of logs grouped by level"""
+    logger.info("📥 Get stats by level endpoint called")
+    
+    if collection is None:
+        logger.error("❌ Database collection not available")
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    try:
+        pipeline = [
+            {
+                "$group": {
+                    "_id": "$level",
+                    "count": {"$sum": 1}
+                }
+            },
+            {
+                "$sort": {"count": -1}
+            }
+        ]
+        
+        results = await collection.aggregate(pipeline).to_list(length=None)
+        stats = [{"level": item["_id"], "count": item["count"]} for item in results]
+        
+        logger.info(f"✅ Retrieved stats for {len(stats)} levels")
+        return {"stats": stats}
+    except Exception as e:
+        logger.error(f"❌ Error getting level stats: {e}")
+        raise HTTPException(status_code=500, detail=f"Stats query error: {str(e)}")
+
+
+@app.get("/logs/stats/over-time")
+async def get_stats_over_time(
+    hours: int = Query(default=24, description="Number of hours to look back"),
+    interval: str = Query(default="hour", description="Grouping interval: hour or day")
+):
+    """Get log counts over time"""
+    logger.info(f"📥 Get stats over time endpoint called: hours={hours}, interval={interval}")
+    
+    if collection is None:
+        logger.error("❌ Database collection not available")
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    try:
+        cutoff_time = datetime.utcnow() - timedelta(hours=hours)
+        
+        # Determine grouping format based on interval
+        if interval == "hour":
+            date_format = "%Y-%m-%d %H:00"
+        else:
+            date_format = "%Y-%m-%d"
+        
+        pipeline = [
+            {
+                "$match": {
+                    "timestamp": {"$gte": cutoff_time}
+                }
+            },
+            {
+                "$group": {
+                    "_id": {
+                        "time": {
+                            "$dateToString": {
+                                "format": date_format,
+                                "date": "$timestamp"
+                            }
+                        },
+                        "level": "$level"
+                    },
+                    "count": {"$sum": 1}
+                }
+            },
+            {
+                "$sort": {"_id.time": 1}
+            }
+        ]
+        
+        results = await collection.aggregate(pipeline).to_list(length=None)
+        
+        # Transform data for easier frontend consumption
+        time_series = {}
+        for item in results:
+            time = item["_id"]["time"]
+            level = item["_id"]["level"]
+            count = item["count"]
+            
+            if time not in time_series:
+                time_series[time] = {"time": time, "INFO": 0, "WARNING": 0, "ERROR": 0}
+            
+            time_series[time][level] = count
+        
+        logger.info(f"✅ Retrieved time series data with {len(time_series)} time points")
+        return {"data": list(time_series.values())}
+    except Exception as e:
+        logger.error(f"❌ Error getting time series stats: {e}")
+        raise HTTPException(status_code=500, detail=f"Stats query error: {str(e)}")
+
+
+@app.get("/logs/stats/top-events")
+async def get_top_events(limit: int = Query(default=10, description="Number of top events to return")):
+    """Get most common events"""
+    logger.info(f"📥 Get top events endpoint called: limit={limit}")
+    
+    if collection is None:
+        logger.error("❌ Database collection not available")
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    try:
+        pipeline = [
+            {
+                "$group": {
+                    "_id": "$event",
+                    "count": {"$sum": 1}
+                }
+            },
+            {
+                "$sort": {"count": -1}
+            },
+            {
+                "$limit": limit
+            }
+        ]
+        
+        results = await collection.aggregate(pipeline).to_list(length=None)
+        events = [{"event": item["_id"], "count": item["count"]} for item in results]
+        
+        logger.info(f"✅ Retrieved top {len(events)} events")
+        return {"events": events}
+    except Exception as e:
+        logger.error(f"❌ Error getting top events: {e}")
+        raise HTTPException(status_code=500, detail=f"Stats query error: {str(e)}")
+
+
+@app.get("/logs/stats/summary")
+async def get_summary_stats():
+    """Get overall summary statistics"""
+    logger.info("📥 Get summary stats endpoint called")
+    
+    if collection is None:
+        logger.error("❌ Database collection not available")
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    try:
+        total_logs = await collection.count_documents({})
+        
+        # Count by level
+        info_count = await collection.count_documents({"level": "INFO"})
+        warning_count = await collection.count_documents({"level": "WARNING"})
+        error_count = await collection.count_documents({"level": "ERROR"})
+        
+        # Recent logs (last 24 hours)
+        cutoff_time = datetime.utcnow() - timedelta(hours=24)
+        recent_logs = await collection.count_documents({"timestamp": {"$gte": cutoff_time}})
+        recent_errors = await collection.count_documents({
+            "timestamp": {"$gte": cutoff_time},
+            "level": "ERROR"
+        })
+        
+        # Calculate error rate
+        error_rate = (error_count / total_logs * 100) if total_logs > 0 else 0
+        recent_error_rate = (recent_errors / recent_logs * 100) if recent_logs > 0 else 0
+        
+        logger.info(f"✅ Summary stats calculated: {total_logs} total logs, {error_rate:.2f}% error rate")
+        
+        return {
+            "total_logs": total_logs,
+            "info_count": info_count,
+            "warning_count": warning_count,
+            "error_count": error_count,
+            "error_rate": round(error_rate, 2),
+            "recent_logs_24h": recent_logs,
+            "recent_errors_24h": recent_errors,
+            "recent_error_rate": round(recent_error_rate, 2)
+        }
+    except Exception as e:
+        logger.error(f"❌ Error getting summary stats: {e}")
+        raise HTTPException(status_code=500, detail=f"Stats query error: {str(e)}")
+
+
+@app.get("/logs/stats/by-host")
+async def get_stats_by_host(limit: int = Query(default=10, description="Number of top hosts to return")):
+    """Get log counts grouped by host"""
+    logger.info(f"📥 Get stats by host endpoint called: limit={limit}")
+    
+    if collection is None:
+        logger.error("❌ Database collection not available")
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    try:
+        pipeline = [
+            {
+                "$group": {
+                    "_id": "$host",
+                    "total": {"$sum": 1},
+                    "errors": {
+                        "$sum": {
+                            "$cond": [{"$eq": ["$level", "ERROR"]}, 1, 0]
+                        }
+                    }
+                }
+            },
+            {
+                "$sort": {"total": -1}
+            },
+            {
+                "$limit": limit
+            }
+        ]
+        
+        results = await collection.aggregate(pipeline).to_list(length=None)
+        
+        hosts = [
+            {
+                "host": item["_id"],
+                "total": item["total"],
+                "errors": item["errors"]
+            }
+            for item in results
+        ]
+        
+        logger.info(f"✅ Retrieved stats for {len(hosts)} hosts")
+        return {"hosts": hosts}
+    except Exception as e:
+        logger.error(f"❌ Error getting host stats: {e}")
+        raise HTTPException(status_code=500, detail=f"Stats query error: {str(e)}")
+
 # Kafka management endpoints
 @app.post("/kafka/start")
 async def start_kafka_consumer():
