@@ -1,15 +1,19 @@
 import React, { useState } from "react";
 import LogsDashboard from "./components/LogsDashboard";
 import AnalyticsDashboard from "./components/AnalyticsDashboard";
+import "./App.css";
 
 export default function App() {
   const [activeView, setActiveView] = useState("logs");
 
   return (
-    <div className="min-h-screen bg-charcoal-900">
+    <div className="min-h-screen bg-charcoal-900 text-gray-200">
       {/* Top Navigation Banner */}
-      <div className="px-8 py-4">
-        <div className="flex justify-end gap-3">
+      <header className="px-8 py-4 flex justify-between items-center bg-charcoal-800 shadow-md">
+        <h1 className="text-2xl font-bold text-coral-500 tracking-wide">
+          CyberLogs
+        </h1>
+        <div className="flex gap-3">
           <button
             onClick={() => setActiveView("logs")}
             className={`px-5 py-2 rounded-lg font-semibold transition ${
@@ -31,10 +35,12 @@ export default function App() {
             Analytics
           </button>
         </div>
-      </div>
+      </header>
 
-      {/* Content */}
-      {activeView === "logs" ? <LogsDashboard /> : <AnalyticsDashboard />}
+      {/* Main Content */}
+      <main className="p-6">
+        {activeView === "logs" ? <LogsDashboard /> : <AnalyticsDashboard />}
+      </main>
     </div>
   );
 }
