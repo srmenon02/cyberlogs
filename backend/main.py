@@ -16,6 +16,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from dotenv import load_dotenv
 import os
 import logging
+from dateutil import parser
 
 # Setup detailed logging
 logging.basicConfig(
@@ -595,6 +596,71 @@ async def get_stats_by_host(limit: int = Query(default=10, description="Number o
     except Exception as e:
         logger.error(f"❌ Error getting host stats: {e}")
         raise HTTPException(status_code=500, detail=f"Stats query error: {str(e)}")
+@app.get("/api/analytics")
+async def get_analytics(days: int = 7):
+    """
+    Returns analytics for the past N days.
+    - chartData: requests and alerts per day
+    - pieData: distribution by severity
+    """
+    logger.info(f"📥 /api/analytics called: days={days}")
+
+    if collection is None:
+        logger.error("❌ Database collection not available")
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    try:
+        now = datetime.utcnow()
+        since = now - timedelta(days=days)
+
+        # Fetch logs from MongoDB for the past N days
+        cursor = collection.find({"timestamp": {"$gte": since}})
+        logs = await cursor.to_list(length=None)
+
+        if not logs:
+            logger.warning("⚠️ No logs found for analytics")
+            return {"chartData": [], "pieData": [], "totalLogs": 0}
+
+        # Aggregate daily counts
+        daily_counts = {}
+        severity_counts = {"INFO": 0, "WARNING": 0, "ERROR": 0, "CRITICAL": 0}
+
+        for log in logs:
+            ts = log.get("timestamp")
+            if isinstance(ts, str):
+                try:
+                    ts = parser.isoparse(ts)  # robustly handles +00:00
+                except Exception:
+                    continue  # skip invalid timestamps
+            elif not isinstance(ts, datetime):
+                continue  # skip logs without valid timestamp
+            
+            day_str = ts.strftime("%a")  # e.g., Mon, Tue, ...
+            daily_counts[day_str] = daily_counts.get(day_str, 0) + 1
+
+            severity = log.get("level", "INFO").upper()
+            if severity not in severity_counts:
+                severity_counts[severity] = 0
+            severity_counts[severity] += 1
+
+        # Prepare line chart data
+        chart_data = [{"name": day, "requests": count, "alerts": max(1, count // 10)}
+                      for day, count in daily_counts.items()]
+
+        # Prepare pie chart data
+        pie_data = [{"name": level, "value": count} for level, count in severity_counts.items() if count > 0]
+
+        logger.info(f"✅ Analytics prepared: {len(chart_data)} days, {len(pie_data)} severities")
+
+        return {
+            "chartData": chart_data,
+            "pieData": pie_data,
+            "totalLogs": len(logs)
+        }
+
+    except Exception as e:
+        logger.error(f"❌ Error generating analytics: {e}")
+        raise HTTPException(status_code=500, detail=f"Analytics error: {str(e)}")
 
 # Kafka management endpoints
 @app.post("/kafka/start")
