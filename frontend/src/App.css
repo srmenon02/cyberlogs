@@ -12,7 +12,12 @@
     animation: App-logo-spin infinite 20s linear;
   }
 }
-
+.fancy-header {
+  font-family: 'Audiowide', cursive;
+}
+.fancy-font {
+  font-family: 'Audiowide', cursive;
+}
 .App-header {
   background-color: #282c34;
   min-height: 100vh;

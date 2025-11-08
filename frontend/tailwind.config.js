@@ -7,6 +7,9 @@ module.exports = {
   ],
   theme: {
     extend: {
+      fontFamily: {
+        orbitron: ['Audiowide', 'sans-serif'],
+      },
       colors: {
         charcoal: {
           900: "#1a202c",

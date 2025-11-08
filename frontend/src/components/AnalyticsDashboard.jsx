@@ -43,8 +43,8 @@ export default function AnalyticsDashboard() {
               labelStyle={{ color: "#fff" }}
             />
             <Legend />
-            <Line type="monotone" dataKey="requests" stroke="#3b82f6" strokeWidth={2} />
             <Line type="monotone" dataKey="alerts" stroke="#ef4444" strokeWidth={2} />
+            <Line type="monotone" dataKey="requests" stroke="#3b82f6" strokeWidth={2} />
           </LineChart>
         </ResponsiveContainer>
       </div>
@@ -52,7 +52,7 @@ export default function AnalyticsDashboard() {
       {/* Pie chart */}
       <div className="bg-charcoal-800 rounded-2xl p-6 shadow-lg">
         <h2 className="text-lg font-semibold mb-4 text-coral-400">
-          Alert Severity Distribution
+          Request Severity Distribution
         </h2>
         <ResponsiveContainer width="100%" height={300}>
           <PieChart>
@@ -68,7 +68,7 @@ export default function AnalyticsDashboard() {
               ))}
             </Pie>
             <Tooltip
-              contentStyle={{ backgroundColor: "#1f1f1f", border: "none" }}
+              contentStyle={{ backgroundColor: "#ccc0c0ff", border: "none" }}
               labelStyle={{ color: "#fff" }}
             />
           </PieChart>
