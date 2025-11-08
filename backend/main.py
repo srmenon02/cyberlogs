@@ -17,13 +17,31 @@ from dotenv import load_dotenv
 import os
 import logging
 from dateutil import parser
+# Logging configuration
+import logging
+from logging.handlers import RotatingFileHandler
+import os
 
-# Setup detailed logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+# Ensure a logs directory exists
+os.makedirs("logs", exist_ok=True)
+
+# Setup rotating file handler
+log_file = "logs/backend_debug.log"
+file_handler = RotatingFileHandler(log_file, maxBytes=5_000_000, backupCount=3)
+console_handler = logging.StreamHandler()
+
+# Formatter
+formatter = logging.Formatter(
+    "%(asctime)s - %(levelname)s - %(name)s - %(message)s"
 )
-logger = logging.getLogger(__name__)
+file_handler.setFormatter(formatter)
+console_handler.setFormatter(formatter)
+
+# Root logger setup
+logger = logging.getLogger("cryptosecure")
+logger.setLevel(logging.DEBUG)  # captures debug, info, warning, error
+logger.addHandler(file_handler)
+logger.addHandler(console_handler)
 
 # FIXED: Only create FastAPI app once
 app = FastAPI(title="CryptoSecure Logs API", version="1.0.0")
@@ -614,9 +632,11 @@ async def get_analytics(days: int = 7):
         since = now - timedelta(days=days)
 
         # Fetch logs from MongoDB for the past N days
-        cursor = collection.find({"timestamp": {"$gte": since}})
+        since_str = since.isoformat()
+        cursor = collection.find({"timestamp": {"$gte": since_str}})
         logs = await cursor.to_list(length=None)
-
+        logger.debug(f"Using database: {db.name}, collection: {collection.name}")
+        logger.debug(f"Retrieved {len(logs)} total logs for analytics")
         if not logs:
             logger.warning("⚠️ No logs found for analytics")
             return {"chartData": [], "pieData": [], "totalLogs": 0}
@@ -630,9 +650,12 @@ async def get_analytics(days: int = 7):
             if isinstance(ts, str):
                 try:
                     ts = parser.isoparse(ts)  # robustly handles +00:00
+                    logging.debug(f"Parsed timestamp successfully: {ts.isoformat()} | Event: {log.get('event')}")
                 except Exception:
+                    logging.debug(f"Skipping log due to invalid timestamp format: {ts} | Error: {e}")
                     continue  # skip invalid timestamps
             elif not isinstance(ts, datetime):
+                logging.debug(f"Skipping log with unexpected timestamp type: {type(ts)} | Value: {ts}")
                 continue  # skip logs without valid timestamp
             
             day_str = ts.strftime("%a")  # e.g., Mon, Tue, ...
