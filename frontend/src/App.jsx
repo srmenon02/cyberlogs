@@ -4,13 +4,13 @@ import AnalyticsDashboard from "./components/AnalyticsDashboard";
 import "./App.css";
 
 export default function App() {
-  const [activeView, setActiveView] = useState("logs");
+  const [activeView, setActiveView] = useState("analytics");
 
   return (
     <div className="min-h-screen bg-charcoal-900 text-gray-200">
       {/* Top Navigation Banner */}
-      <header className="px-8 py-4 flex justify-between items-center bg-charcoal-800 shadow-md">
-        <h1 className="text-2xl font-bold text-coral-500 tracking-wide">
+      <header className="px-8 py-4 flex justify-between items-center bg-charcoal-800 shadow-md fancy-font bg-transparent">
+        <h1 className="text-2xl font-bold text-coral-500 tracking-wide fancy-header">
           CyberLogs
         </h1>
         <div className="flex gap-3">
