@@ -322,6 +322,9 @@ async def startup_event():
             try:
                 doc_count = await collection.count_documents({})
                 logger.info(f"📊 Collection '{COLLECTION_NAME}' has {doc_count} documents")
+                logger.info("🔧 Ensuring MongoDB indexes...")
+                await collection.create_index("timestamp")
+                logger.info("Index on 'timestamp' created or already exists")
             except Exception as e:
                 logger.warning(f"⚠️ Could not get collection stats: {e}")
                 
@@ -615,75 +618,83 @@ async def get_stats_by_host(limit: int = Query(default=10, description="Number o
         logger.error(f"❌ Error getting host stats: {e}")
         raise HTTPException(status_code=500, detail=f"Stats query error: {str(e)}")
 @app.get("/api/analytics")
-async def get_analytics(days: int = 7):
+async def get_analytics(interval: str = Query("day", regex="^(year|month|week|day|hour)$")):
     """
-    Returns analytics for the past N days.
-    - chartData: requests and alerts per day
-    - pieData: distribution by severity
+    Returns analytics data aggregated by time interval.
+    Valid intervals: year, month, week, day, hour
     """
-    logger.info(f"📥 /api/analytics called: days={days}")
+    logger.info(f"📥 /api/analytics called: interval={interval}")
 
     if collection is None:
         logger.error("❌ Database collection not available")
         raise HTTPException(status_code=503, detail="Database not available")
 
-    try:
-        now = datetime.utcnow()
-        since = now - timedelta(days=days)
+    now = datetime.utcnow()
+    delta = {
+        "year": timedelta(days=365),
+        "month": timedelta(days=30),
+        "week": timedelta(days=7),
+        "day": timedelta(days=1),
+        "hour": timedelta(hours=24),
+    }[interval]
+    since = now - delta
 
-        # Fetch logs from MongoDB for the past N days
-        since_str = since.isoformat()
-        cursor = collection.find({"timestamp": {"$gte": since_str}})
-        logs = await cursor.to_list(length=None)
-        logger.debug(f"Using database: {db.name}, collection: {collection.name}")
-        logger.debug(f"Retrieved {len(logs)} total logs for analytics")
-        if not logs:
-            logger.warning("⚠️ No logs found for analytics")
-            return {"chartData": [], "pieData": [], "totalLogs": 0}
+    # Fetch logs since that time
+    since_str = since.isoformat()
+    cursor = collection.find({"timestamp": {"$gte": since_str}})
+    logs = await cursor.to_list(length=None)
 
-        # Aggregate daily counts
-        daily_counts = {}
-        severity_counts = {"INFO": 0, "WARNING": 0, "ERROR": 0, "CRITICAL": 0}
+    logger.debug(f"Retrieved {len(logs)} logs for interval={interval}")
+    if not logs:
+        logger.warning("⚠️ No logs found for analytics")
+        return {"chartData": [], "pieData": [], "totalLogs": 0}
 
-        for log in logs:
-            ts = log.get("timestamp")
-            if isinstance(ts, str):
-                try:
-                    ts = parser.isoparse(ts)  # robustly handles +00:00
-                    logging.debug(f"Parsed timestamp successfully: {ts.isoformat()} | Event: {log.get('event')}")
-                except Exception:
-                    logging.debug(f"Skipping log due to invalid timestamp format: {ts} | Error: {e}")
-                    continue  # skip invalid timestamps
-            elif not isinstance(ts, datetime):
-                logging.debug(f"Skipping log with unexpected timestamp type: {type(ts)} | Value: {ts}")
-                continue  # skip logs without valid timestamp
-            
-            day_str = ts.strftime("%a")  # e.g., Mon, Tue, ...
-            daily_counts[day_str] = daily_counts.get(day_str, 0) + 1
+    chart_data = {}
+    severity_counts = {"INFO": 0, "WARNING": 0, "ERROR": 0, "CRITICAL": 0}
 
-            severity = log.get("level", "INFO").upper()
-            if severity not in severity_counts:
-                severity_counts[severity] = 0
-            severity_counts[severity] += 1
+    # Group timestamps dynamically based on interval
+    for log in logs:
+        ts = log.get("timestamp")
+        if isinstance(ts, str):
+            try:
+                ts = parser.isoparse(ts)
+            except Exception as e:
+                logger.debug(f"Skipping invalid timestamp: {ts} | {e}")
+                continue
+        elif not isinstance(ts, datetime):
+            continue
 
-        # Prepare line chart data
-        chart_data = [{"name": day, "requests": count, "alerts": max(1, count // 10)}
-                      for day, count in daily_counts.items()]
+        if interval == "year":
+            key = ts.strftime("%Y")
+        elif interval == "month":
+            key = ts.strftime("%b %Y")
+        elif interval == "week":
+            key = f"Week {ts.isocalendar().week}"
+        elif interval == "day":
+            key = ts.strftime("%a %d")
+        elif interval == "hour":
+            key = ts.strftime("%H:00")
 
-        # Prepare pie chart data
-        pie_data = [{"name": level, "value": count} for level, count in severity_counts.items() if count > 0]
+        chart_data[key] = chart_data.get(key, 0) + 1
 
-        logger.info(f"✅ Analytics prepared: {len(chart_data)} days, {len(pie_data)} severities")
+        severity = log.get("level", "INFO").upper()
+        if severity not in severity_counts:
+            severity_counts[severity] = 0
+        severity_counts[severity] += 1
 
-        return {
-            "chartData": chart_data,
-            "pieData": pie_data,
-            "totalLogs": len(logs)
-        }
+    # Prepare front-end chart format
+    chart_data_list = [
+        {"name": k, "requests": v, "alerts": max(1, v // 10)} for k, v in sorted(chart_data.items())
+    ]
+    pie_data_list = [
+        {"name": lvl, "value": cnt} for lvl, cnt in severity_counts.items() if cnt > 0
+    ]
 
-    except Exception as e:
-        logger.error(f"❌ Error generating analytics: {e}")
-        raise HTTPException(status_code=500, detail=f"Analytics error: {str(e)}")
+    return {
+        "chartData": chart_data_list,
+        "pieData": pie_data_list,
+        "totalLogs": len(logs),
+    }
 
 # Kafka management endpoints
 @app.post("/kafka/start")
