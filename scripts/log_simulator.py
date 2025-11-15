@@ -57,7 +57,7 @@ if __name__ == "__main__":
             time.sleep(0.1)
             producer.send(topic, log)
             print("Sent:", log)
-            time.sleep(random.uniform(0.5, 2.0))
+            time.sleep(random.uniform(5, 10))
     except KeyboardInterrupt:
         print("Stopped log simulation.")
     finally:
