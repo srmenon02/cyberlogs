@@ -180,6 +180,14 @@ def get_kafka_consumer():
 async def save_log(log):
     try:
         if collection:
+            # Convert timestamp string to datetime object
+            if "timestamp" in log and isinstance(log["timestamp"], str):
+                try:
+                    log["timestamp"] = datetime.fromisoformat(log["timestamp"])
+                except ValueError:
+                    log["timestamp"] = datetime.utcnow()  # Fallback to current time
+            elif "timestamp" not in log:
+                log["timestamp"] = datetime.utcnow()  # Add timestamp if missing
             result = await collection.insert_one(log)
             logger.info(f"Saved log with id: {result.inserted_id}")
     except Exception as e:

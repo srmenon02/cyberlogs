@@ -323,7 +323,8 @@ async def startup_event():
                 doc_count = await collection.count_documents({})
                 logger.info(f"📊 Collection '{COLLECTION_NAME}' has {doc_count} documents")
                 logger.info("🔧 Ensuring MongoDB indexes...")
-                await collection.create_index("timestamp")
+                await collection.create_index([("timestamp", 1)])
+                await collection.create_index([("timestamp", 1), ("level", 1)])
                 logger.info("Index on 'timestamp' created or already exists")
             except Exception as e:
                 logger.warning(f"⚠️ Could not get collection stats: {e}")
@@ -617,6 +618,7 @@ async def get_stats_by_host(limit: int = Query(default=10, description="Number o
     except Exception as e:
         logger.error(f"❌ Error getting host stats: {e}")
         raise HTTPException(status_code=500, detail=f"Stats query error: {str(e)}")
+    
 @app.get("/api/analytics")
 async def get_analytics(interval: str = Query("day", regex="^(year|month|week|day|hour)$")):
     """
@@ -638,82 +640,96 @@ async def get_analytics(interval: str = Query("day", regex="^(year|month|week|da
         "hour": timedelta(hours=24),
     }[interval]
     since = now - delta
-
-    # Fetch logs since that time
     since_str = since.isoformat()
-    cursor = collection.find({"timestamp": {"$gte": since_str}})
-    logs = await cursor.to_list(length=None)
 
-    logger.debug(f"Retrieved {len(logs)} logs for interval={interval}")
-    if not logs:
+    # -----------------------------
+    # AGGREGATION PIPELINE
+    # -----------------------------
+    # Decide how to extract the "time" key per interval
+    time_expr = {}
+    if interval == "year":
+        time_expr = {"$year": {"$toDate": "$timestamp"}}
+    elif interval == "month":
+        time_expr = {"$month": {"$toDate": "$timestamp"}}
+    elif interval == "week":
+        time_expr = {"$isoWeek": {"$toDate": "$timestamp"}}
+    elif interval == "day":
+        time_expr = {"$dayOfMonth": {"$toDate": "$timestamp"}}
+    elif interval == "hour":
+        time_expr = {"$hour": {"$toDate": "$timestamp"}}
+
+    pipeline = [
+        {"$match": {"timestamp": {"$gte": since_str}}},
+        {
+            "$group": {
+                "_id": {
+                    "time": time_expr,
+                    "level": "$level"
+                },
+                "count": {"$sum": 1}
+            }
+        },
+        {"$sort": {"_id.time": 1}}
+    ]
+
+    results = await collection.aggregate(pipeline).to_list(length=None)
+
+    if not results:
         logger.warning("⚠️ No logs found for analytics")
         return {"chartData": [], "pieData": [], "totalLogs": 0}
 
-    chart_data = {}
-    severity_counts = {"INFO": 0, "WARNING": 0, "ERROR": 0, "CRITICAL": 0}
+    # -----------------------------
+    # BUILD CHART DATA
+    # -----------------------------
+    chart_data = []
+    severity_counts = {}
 
-    # Group timestamps dynamically based on interval
-    for log in logs:
-        ts = log.get("timestamp")
-        if isinstance(ts, str):
-            try:
-                ts = parser.isoparse(ts)
-            except Exception as e:
-                logger.debug(f"Skipping invalid timestamp: {ts} | {e}")
-                continue
-        elif not isinstance(ts, datetime):
-            continue
+    for item in results:
+        raw_time = item["_id"]["time"]
+        level = item["_id"]["level"]
+        count = item["count"]
 
-        if interval == "year":
-            key = ts.strftime("%Y")
-        elif interval == "month":
-            key = ts.strftime("%b %Y")
-        elif interval == "week":
-            key = f"Week {ts.isocalendar().week}"
+        # Format labels by interval
+        if interval == "hour":
+            dt = datetime(now.year, now.month, now.day, int(raw_time))
+            label = dt.strftime("%-I:00 %p")
+            sort_key = int(raw_time)
         elif interval == "day":
-            key = ts.strftime("%a %d")
-        elif interval == "hour":
-            key = ts.strftime("%H:00")
+            dt = datetime(now.year, now.month, int(raw_time))
+            label = dt.strftime("%A %B %-d")
+            sort_key = dt.timestamp()
+        elif interval == "week":
+            dt = datetime.fromisocalendar(now.year, int(raw_time), 1)
+            label = dt.strftime("%m/%d")
+            sort_key = dt.timestamp()
+        elif interval == "month":
+            dt = datetime(now.year, int(raw_time), 1)
+            label = dt.strftime("%b")
+            sort_key = int(raw_time)
+        elif interval == "year":
+            label = str(raw_time)
+            sort_key = int(raw_time)
 
-        chart_data[key] = chart_data.get(key, 0) + 1
+        chart_data.append({
+            "label": label,
+            "requests": count,
+            "alerts": max(1, count // 10),
+            "sort_key": sort_key,
+        })
 
-        severity = log.get("level", "INFO").upper()
-        if severity not in severity_counts:
-            severity_counts[severity] = 0
-        severity_counts[severity] += 1
+        severity_counts[level] = severity_counts.get(level, 0) + count
 
-    # Prepare front-end chart format
-    chart_data_list = [
-        {"name": k, "requests": v, "alerts": max(1, v // 10)} for k, v in sorted(chart_data.items())
-    ]
-    pie_data_list = [
-        {"name": lvl, "value": cnt} for lvl, cnt in severity_counts.items() if cnt > 0
-    ]
+    chart_data_list = sorted(chart_data, key=lambda x: x["sort_key"])
+    pie_data_list = [{"name": lvl, "value": cnt} for lvl, cnt in severity_counts.items() if cnt > 0]
 
     return {
-        "chartData": chart_data_list,
+        "chartData": [
+            {"name": item["label"], "requests": item["requests"], "alerts": item["alerts"]}
+            for item in chart_data_list
+        ],
         "pieData": pie_data_list,
-        "totalLogs": len(logs),
+        "totalLogs": sum(item["requests"] for item in chart_data_list)
     }
-
-# Kafka management endpoints
-@app.post("/kafka/start")
-async def start_kafka_consumer():
-    global consumer_task
-    logger.info("📥 Start Kafka consumer endpoint called")
-    
-    if consumer_task and not consumer_task.done():
-        logger.warning("⚠️ Kafka consumer is already running")
-        return {"status": "error", "message": "Kafka consumer is already running"}
-    
-    try:
-        logger.info("🚀 Starting Kafka consumer via API...")
-        consumer_task = asyncio.create_task(consume_and_store())
-        logger.info("✅ Kafka consumer started successfully!")
-        return {"status": "success", "message": "Kafka consumer started"}
-    except Exception as e:
-        logger.error(f"❌ Failed to start Kafka consumer: {e}")
-        return {"status": "error", "message": f"Failed to start Kafka consumer: {str(e)}"}
 
 @app.post("/kafka/stop")
 async def stop_kafka_consumer():
