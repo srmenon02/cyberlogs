@@ -660,6 +660,8 @@ async def get_analytics(interval: str = Query("day", regex="^(year|month|week|da
 
     pipeline = [
         {"$match": {"timestamp": {"$gte": since_str}}},
+
+        # Group 1 — group by (interval bucket, severity level)
         {
             "$group": {
                 "_id": {
@@ -669,8 +671,24 @@ async def get_analytics(interval: str = Query("day", regex="^(year|month|week|da
                 "count": {"$sum": 1}
             }
         },
-        {"$sort": {"_id.time": 1}}
+
+        # Group 2 — merge all levels into a single count per time bucket
+        {
+            "$group": {
+                "_id": "$_id.time",
+                "total_count": {"$sum": "$count"},
+                "levels": {
+                    "$push": {
+                        "level": "$_id.level",
+                        "count": "$count"
+                    }
+                }
+            }
+        },
+
+        {"$sort": {"_id": 1}}
     ]
+
 
     results = await collection.aggregate(pipeline).to_list(length=None)
 
@@ -685,9 +703,9 @@ async def get_analytics(interval: str = Query("day", regex="^(year|month|week|da
     severity_counts = {}
 
     for item in results:
-        raw_time = item["_id"]["time"]
-        level = item["_id"]["level"]
-        count = item["count"]
+        raw_time = item["_id"]          # now it's just the time bucket
+        count = item["total_count"]     # merged count from all severities
+        levels = item["levels"] 
 
         # Format labels by interval
         if interval == "hour":
@@ -716,8 +734,10 @@ async def get_analytics(interval: str = Query("day", regex="^(year|month|week|da
             "alerts": max(1, count // 10),
             "sort_key": sort_key,
         })
-
-        severity_counts[level] = severity_counts.get(level, 0) + count
+        for lvl_obj in levels:
+            lvl = lvl_obj["level"]
+            cnt = lvl_obj["count"]
+            severity_counts[lvl] = severity_counts.get(lvl, 0) + cnt
 
     chart_data_list = sorted(chart_data, key=lambda x: x["sort_key"])
     pie_data_list = [{"name": lvl, "value": cnt} for lvl, cnt in severity_counts.items() if cnt > 0]
