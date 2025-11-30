@@ -20,3 +20,4 @@ backend/test_kafka.py
 backup_logs/
 mongdobd_migration.py
 ./github/*
+PERFORMANCE_OPTIMIZATION.md
