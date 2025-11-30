@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useState, useRef } from "react";
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer,
   PieChart, Pie, Cell
@@ -7,29 +7,90 @@ import {
 const COLORS = ["#ef4444", "#f59e0b", "#3b82f6", "#10b981"]; // red, amber, blue, green
 const INTERVALS = ["year", "month", "week", "day", "hour"];
 
+// Frontend cache for analytics (TTL: 60 seconds)
+const analyticsCache = new Map();
+const FRONTEND_CACHE_TTL = 60000; // 60 seconds in milliseconds
+
 export default function AnalyticsDashboard() {
   const [chartData, setChartData] = useState([]);
   const [pieData, setPieData] = useState([]);
   const [loading, setLoading] = useState(true);
   const [interval, setInterval] = useState("day"); // default interval
+  const debounceTimer = useRef(null);
+  const [cacheStatus, setCacheStatus] = useState(""); // For debugging
 
-  const fetchAnalytics = (selectedInterval) => {
+  // Fetch with frontend caching and debouncing
+  const fetchAnalyticsWithCache = async (selectedInterval) => {
+    const cacheKey = `analytics_${selectedInterval}`;
+    
+    // Check frontend cache first
+    if (analyticsCache.has(cacheKey)) {
+      const cached = analyticsCache.get(cacheKey);
+      if (Date.now() - cached.timestamp < FRONTEND_CACHE_TTL) {
+        console.log(`✅ Cache HIT for ${selectedInterval}`);
+        setCacheStatus(`Loaded from cache (${selectedInterval})`);
+        setChartData(cached.data.chartData);
+        setPieData(cached.data.pieData);
+        setLoading(false);
+        return;
+      }
+    }
+
+    // Cache miss - fetch from API
+    console.log(`⏭️ Cache MISS for ${selectedInterval}, fetching from API...`);
+    setCacheStatus(`Fetching from server (${selectedInterval})...`);
     setLoading(true);
-    fetch(`http://localhost:8000/api/analytics?interval=${selectedInterval}`)
-      .then((res) => res.json())
-      .then((data) => {
-        setChartData(data.chartData);
-        setPieData(data.pieData);
-      })
-      .catch((err) => console.error("Failed to load analytics:", err))
-      .finally(() => setLoading(false));
+    
+    try {
+      const response = await fetch(
+        `http://localhost:8000/api/analytics?interval=${selectedInterval}`
+      );
+      const data = await response.json();
+      
+      // Store in frontend cache
+      analyticsCache.set(cacheKey, {
+        data,
+        timestamp: Date.now()
+      });
+      
+      setChartData(data.chartData);
+      setPieData(data.pieData);
+      setCacheStatus(`Loaded from server (${selectedInterval})`);
+    } catch (err) {
+      console.error("Failed to load analytics:", err);
+      setCacheStatus(`Error loading ${selectedInterval}`);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Debounced interval change handler
+  const handleIntervalChange = (newInterval) => {
+    setInterval(newInterval);
+    
+    // Clear previous debounce timer
+    if (debounceTimer.current) {
+      clearTimeout(debounceTimer.current);
+    }
+    
+    // Set new debounce timer - wait 300ms before fetching
+    debounceTimer.current = setTimeout(() => {
+      fetchAnalyticsWithCache(newInterval);
+    }, 300);
   };
 
   useEffect(() => {
-    fetchAnalytics(interval);
+    fetchAnalyticsWithCache(interval);
+    
+    // Cleanup timer on unmount
+    return () => {
+      if (debounceTimer.current) {
+        clearTimeout(debounceTimer.current);
+      }
+    };
   }, [interval]);
 
-  if (loading) {
+  if (loading && chartData.length === 0) {
     return <div className="text-center text-gray-400 p-10">Loading analytics...</div>;
   }
 
@@ -37,10 +98,10 @@ export default function AnalyticsDashboard() {
     <div className="p-6 grid grid-cols-1 gap-6 text-gray-200">
       {/* Interval selector */}
       <div className="mb-4 flex gap-2 items-center">
-        <span className="text-gray-400 font-semibold">Interval:</span>
+        <span className="text-gray-400 font-semibold">Timeframe:</span>
         <select
           value={interval}
-          onChange={(e) => setInterval(e.target.value)}
+          onChange={(e) => handleIntervalChange(e.target.value)}
           className="bg-charcoal-700 text-gray-200 px-3 py-1 rounded-lg"
         >
           {INTERVALS.map((intv) => (
@@ -49,6 +110,8 @@ export default function AnalyticsDashboard() {
             </option>
           ))}
         </select>
+        {loading && <span className="text-xs text-gray-500 ml-2">Loading...</span>}
+        <span className="text-xs text-gray-600 ml-4">{cacheStatus}</span>
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">

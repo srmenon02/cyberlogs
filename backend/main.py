@@ -21,6 +21,10 @@ from dateutil import parser
 import logging
 from logging.handlers import RotatingFileHandler
 import os
+import time
+from functools import lru_cache
+from datetime import timedelta
+
 
 # Ensure a logs directory exists
 os.makedirs("logs", exist_ok=True)
@@ -42,6 +46,11 @@ logger = logging.getLogger("cryptosecure")
 logger.setLevel(logging.DEBUG)  # captures debug, info, warning, error
 logger.addHandler(file_handler)
 logger.addHandler(console_handler)
+
+cache_storage = {}
+CACHE_TTL = 120  # Cache for 120 seconds (increased from 30 for better hit rate)
+def cache_key(interval: str, since_time: str) -> str:
+    return f"{interval}:{since_time}"
 
 # FIXED: Only create FastAPI app once
 app = FastAPI(title="CryptoSecure Logs API", version="1.0.0")
@@ -153,12 +162,12 @@ async def get_logs(
             time_filter["$lte"] = end_dt
         query["timestamp"] = time_filter
 
-    logger.info(f"🔍 MongoDB query: {query}")
+    logger.info(f"MongoDB query: {query}")
 
     # Validate sorting
     allowed_sort_fields = {"timestamp", "level", "_id"}
     if sort_by not in allowed_sort_fields:
-        logger.error(f"❌ Invalid sort field: {sort_by}")
+        logger.error(f"Invalid sort field: {sort_by}")
         raise HTTPException(status_code=400, detail=f"Invalid sort_by field. Choose from {allowed_sort_fields}")
     sort_direction = 1 if sort_order == "asc" else -1
 
@@ -269,7 +278,7 @@ async def save_log(log):
         else:
             logger.error("❌ Cannot save log: collection not available")
     except Exception as e:
-        logger.error(f"❌ Error saving log to MongoDB: {e}")
+        logger.error(f"Error saving log to MongoDB: {e}")
 
 async def consume_and_store():
     try:
@@ -323,17 +332,48 @@ async def startup_event():
                 doc_count = await collection.count_documents({})
                 logger.info(f"📊 Collection '{COLLECTION_NAME}' has {doc_count} documents")
                 logger.info("🔧 Ensuring MongoDB indexes...")
-                await collection.create_index([("timestamp", 1)])
-                await collection.create_index([("timestamp", 1), ("level", 1)])
-                logger.info("Index on 'timestamp' created or already exists")
-            except Exception as e:
-                logger.warning(f"⚠️ Could not get collection stats: {e}")
                 
+                # CREATE OPTIMIZED COMPOUND INDEXES FOR ANALYTICS PERFORMANCE
+                await collection.create_index([("timestamp", 1)])
+                logger.info("✅ Index on 'timestamp' created")
+                
+                # Critical compound index for aggregation queries
+                await collection.create_index([("timestamp", 1), ("level", 1)])
+                logger.info("✅ Index on 'timestamp ASC, level' created (CRITICAL for analytics)")
+                
+                # Additional optimized indexes
+                await collection.create_index([("timestamp", -1), ("level", 1)])
+                logger.info("✅ Index on 'timestamp DESC, level' created")
+                
+                await collection.create_index([("host", 1), ("timestamp", 1)])
+                logger.info("✅ Index on 'host, timestamp' created")
+                
+                # Single field indexes
+                await collection.create_index([("level", 1)])
+                logger.info("✅ Index on 'level' created")
+                
+                await collection.create_index([("host", 1)])
+                logger.info("✅ Index on 'host' created")
+                
+                await collection.create_index([("event", "text")])
+                logger.info("✅ Text index on 'event' created")
+                
+            except Exception as e:
+                logger.warning(f"⚠️ Could not create indexes: {e}")
         else:
             logger.warning("⚠️ MONGO_URI not found in environment")
     except Exception as e:
         logger.error(f"❌ MongoDB connection failed: {e}")
         # Don't fail startup, just log the error
+    
+    # Pre-warm analytics cache for common intervals
+    logger.info("🔥 Pre-warming analytics cache...")
+    try:
+        for interval in ["day", "hour", "week"]:
+            await get_analytics(interval=interval)
+            logger.info(f"✅ Pre-warmed cache for interval={interval}")
+    except Exception as e:
+        logger.warning(f"⚠️ Cache warmup failed: {e}")
     
     # Start Kafka consumer if explicitly enabled
     enable_kafka = os.getenv("ENABLE_KAFKA", "false").lower()
@@ -350,6 +390,7 @@ async def startup_event():
         logger.info("📡 Kafka consumer disabled (set ENABLE_KAFKA=true to enable)")
     
     logger.info("🎉 Startup completed!")
+
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -384,13 +425,6 @@ async def debug_env():
         "kafka_consumer_running": consumer_task is not None and not consumer_task.done(),
         "environment_vars": list(os.environ.keys())  # Just the keys, not values for security
     }
-
-# Add these imports at the top if not already present
-from datetime import timedelta
-
-# =================================================================
-# ANALYTICS ENDPOINTS - Add these before Kafka management endpoints
-# =================================================================
 
 @app.get("/logs/stats/by-level")
 async def get_stats_by_level():
@@ -622,15 +656,16 @@ async def get_stats_by_host(limit: int = Query(default=10, description="Number o
 @app.get("/api/analytics")
 async def get_analytics(interval: str = Query("day", regex="^(year|month|week|day|hour)$")):
     """
-    Returns analytics data aggregated by time interval.
-    Valid intervals: year, month, week, day, hour
+    Returns analytics data aggregated by time interval with detailed timing.
     """
     logger.info(f"📥 /api/analytics called: interval={interval}")
 
     if collection is None:
-        logger.error("❌ Database collection not available")
         raise HTTPException(status_code=503, detail="Database not available")
 
+    # TIMING: Total request
+    total_start = time.time()
+    
     now = datetime.utcnow()
     delta = {
         "year": timedelta(days=365),
@@ -640,12 +675,28 @@ async def get_analytics(interval: str = Query("day", regex="^(year|month|week|da
         "hour": timedelta(hours=24),
     }[interval]
     since = now - delta
-    since_str = since.isoformat()
 
-    # -----------------------------
-    # AGGREGATION PIPELINE
-    # -----------------------------
-    # Decide how to extract the "time" key per interval
+    # TIMING: Cache check
+    cache_start = time.time()
+    cache_id = cache_key(interval, since.isoformat())
+    if cache_id in cache_storage:
+        cached_data, cached_time = cache_storage[cache_id]
+        if time.time() - cached_time < CACHE_TTL:
+            cache_elapsed = time.time() - cache_start
+            logger.info(f"✅ CACHE HIT in {cache_elapsed:.3f}s")
+            return cached_data
+    cache_elapsed = time.time() - cache_start
+    logger.info(f"⏭️ Cache miss ({cache_elapsed:.3f}s), running aggregation...")
+
+    # TIMING: Count documents
+    count_start = time.time()
+    total_docs = await collection.count_documents({"timestamp": {"$gte": since.isoformat()}})
+    count_elapsed = time.time() - count_start
+    logger.info(f"📊 Found {total_docs} documents matching filter in {count_elapsed:.3f}s")
+
+    # TIMING: Aggregation pipeline
+    agg_start = time.time()
+    
     time_expr = {}
     if interval == "year":
         time_expr = {"$year": {"$toDate": "$timestamp"}}
@@ -654,14 +705,17 @@ async def get_analytics(interval: str = Query("day", regex="^(year|month|week|da
     elif interval == "week":
         time_expr = {"$isoWeek": {"$toDate": "$timestamp"}}
     elif interval == "day":
-        time_expr = {"$dayOfMonth": {"$toDate": "$timestamp"}}
+        time_expr = {
+            "$dateToString": {
+                "format": "%Y-%m-%d",
+                "date": {"$toDate": "$timestamp"}
+            }
+        }
     elif interval == "hour":
         time_expr = {"$hour": {"$toDate": "$timestamp"}}
 
     pipeline = [
-        {"$match": {"timestamp": {"$gte": since_str}}},
-
-        # Group 1 — group by (interval bucket, severity level)
+        {"$match": {"timestamp": {"$gte": since.isoformat()}}},
         {
             "$group": {
                 "_id": {
@@ -671,49 +725,37 @@ async def get_analytics(interval: str = Query("day", regex="^(year|month|week|da
                 "count": {"$sum": 1}
             }
         },
-
-        # Group 2 — merge all levels into a single count per time bucket
-        {
-            "$group": {
-                "_id": "$_id.time",
-                "total_count": {"$sum": "$count"},
-                "levels": {
-                    "$push": {
-                        "level": "$_id.level",
-                        "count": "$count"
-                    }
-                }
-            }
-        },
-
-        {"$sort": {"_id": 1}}
+        {"$sort": {"_id.time": 1}}
     ]
 
-
     results = await collection.aggregate(pipeline).to_list(length=None)
+    agg_elapsed = time.time() - agg_start
+    logger.info(f"⏱️ Aggregation pipeline completed in {agg_elapsed:.3f}s")
 
     if not results:
         logger.warning("⚠️ No logs found for analytics")
         return {"chartData": [], "pieData": [], "totalLogs": 0}
 
-    # -----------------------------
-    # BUILD CHART DATA
-    # -----------------------------
+    # TIMING: Data formatting
+    format_start = time.time()
+    
+    # Format results (single-pass aggregation)
     chart_data = []
     severity_counts = {}
+    total_logs = sum(item["count"] for item in results)
 
     for item in results:
-        raw_time = item["_id"]          # now it's just the time bucket
-        count = item["total_count"]     # merged count from all severities
-        levels = item["levels"] 
+        raw_time = item["_id"]["time"]
+        count = item["count"]
+        level = item["_id"]["level"]
 
-        # Format labels by interval
+        # Format time labels based on interval
         if interval == "hour":
             dt = datetime(now.year, now.month, now.day, int(raw_time))
             label = dt.strftime("%-I:00 %p")
             sort_key = int(raw_time)
         elif interval == "day":
-            dt = datetime(now.year, now.month, int(raw_time))
+            dt = datetime.fromisoformat(raw_time)
             label = dt.strftime("%A %B %-d")
             sort_key = dt.timestamp()
         elif interval == "week":
@@ -728,28 +770,46 @@ async def get_analytics(interval: str = Query("day", regex="^(year|month|week|da
             label = str(raw_time)
             sort_key = int(raw_time)
 
-        chart_data.append({
-            "label": label,
-            "requests": count,
-            "alerts": max(1, count // 10),
-            "sort_key": sort_key,
-        })
-        for lvl_obj in levels:
-            lvl = lvl_obj["level"]
-            cnt = lvl_obj["count"]
-            severity_counts[lvl] = severity_counts.get(lvl, 0) + cnt
+        # Find or create chart entry for this time period
+        existing_entry = next((e for e in chart_data if e["sort_key"] == sort_key), None)
+        if existing_entry:
+            existing_entry["requests"] += count
+            existing_entry["alerts"] = max(1, existing_entry["requests"] // 10)
+        else:
+            chart_data.append({
+                "label": label,
+                "requests": count,
+                "alerts": max(1, count // 10),
+                "sort_key": sort_key,
+            })
 
-    chart_data_list = sorted(chart_data, key=lambda x: x["sort_key"])
-    pie_data_list = [{"name": lvl, "value": cnt} for lvl, cnt in severity_counts.items() if cnt > 0]
+        # Track severity counts
+        severity_counts[level] = severity_counts.get(level, 0) + count
 
-    return {
+    chart_data_sorted = sorted(chart_data, key=lambda x: x["sort_key"])
+    pie_data = [{"name": lvl, "value": cnt} for lvl, cnt in severity_counts.items() if cnt > 0]
+
+    response = {
         "chartData": [
             {"name": item["label"], "requests": item["requests"], "alerts": item["alerts"]}
-            for item in chart_data_list
+            for item in chart_data_sorted
         ],
-        "pieData": pie_data_list,
-        "totalLogs": sum(item["requests"] for item in chart_data_list)
+        "pieData": pie_data,
+        "totalLogs": total_logs
     }
+
+    format_elapsed = time.time() - format_start
+    logger.info(f"📝 Data formatting completed in {format_elapsed:.3f}s")
+    
+    # Cache the response
+    cache_storage[cache_id] = (response, time.time())
+
+    # TOTAL TIMING
+    total_elapsed = time.time() - total_start
+    logger.info(f"🎯 TOTAL /api/analytics completed in {total_elapsed:.3f}s")
+    logger.info(f"   Breakdown: count={count_elapsed:.3f}s, agg={agg_elapsed:.3f}s, format={format_elapsed:.3f}s")
+
+    return response
 
 @app.post("/kafka/stop")
 async def stop_kafka_consumer():
