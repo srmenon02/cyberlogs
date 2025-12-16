@@ -22,3 +22,4 @@ mongdobd_migration.py
 ./github/
 PERFORMANCE_OPTIMIZATION.md
 mongdobd_migration.py
+architecture.txt
