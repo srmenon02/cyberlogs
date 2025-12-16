@@ -57,13 +57,16 @@ app = FastAPI(title="CryptoSecure Logs API", version="1.0.0")
 
 # Add middleware
 app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+# CORS configuration - allow frontend origins
+cors_origins = os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",")
+# Always allow localhost for development
+if "http://localhost:5173" not in cors_origins:
+    cors_origins.append("http://localhost:5173")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",  # Local development
-        "https://cyberlogs-teal.vercel.app",
-        "https://fly.io/apps/backend-wandering-bird-8180/configuration",  # Add your production frontend URL when you deploy it
-    ],
+    allow_origins=cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

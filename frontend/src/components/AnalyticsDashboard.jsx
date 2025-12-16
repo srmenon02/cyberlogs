@@ -47,9 +47,20 @@ export default function AnalyticsDashboard() {
     setLoading(true);
     
     try {
+      // Determine API endpoint based on environment
+      const apiUrl = process.env.REACT_APP_API_URL || 
+                     (typeof window !== 'undefined' && window.location.origin.includes('localhost') 
+                       ? 'http://localhost:8000' 
+                       : window.location.origin);
+      
       const response = await fetch(
-        `http://localhost:8000/api/analytics?interval=${selectedInterval}`
+        `${apiUrl}/api/analytics?interval=${selectedInterval}`
       );
+      
+      if (!response.ok) {
+        throw new Error(`API error: ${response.status} ${response.statusText}`);
+      }
+      
       const data = await response.json();
       
       // Store in frontend cache
@@ -63,7 +74,7 @@ export default function AnalyticsDashboard() {
       setCacheStatus(`Loaded from server (${selectedInterval})`);
     } catch (err) {
       console.error("Failed to load analytics:", err);
-      setCacheStatus(`Error loading ${selectedInterval}`);
+      setCacheStatus(`Error loading ${selectedInterval}: ${err.message}`);
     } finally {
       setLoading(false);
     }
