@@ -1,7 +1,7 @@
 import json
 import random
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from datetime import timezone
 from kafka import KafkaProducer
 
@@ -40,8 +40,11 @@ events = [
 ]
 
 def generate_log():
+    random_days_ago = random.uniform(0, 90)
+    random_timestamp = datetime.now(timezone.utc) - timedelta(days=random_days_ago)
+    timestamp = random_timestamp.isoformat()
     return {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": timestamp,
         "level": random.choices(log_levels, weights=[50, 30, 15, 5])[0],
         "event": random.choice(events),
         "host": f"server-{random.randint(1,3)}",
@@ -54,10 +57,10 @@ if __name__ == "__main__":
     try:
         while True:
             log = generate_log()
-            time.sleep(0.1)
+            time.sleep(1)
             producer.send(topic, log)
             print("Sent:", log)
-            time.sleep(random.uniform(0.5, 2.0))
+            time.sleep(random.uniform(5, 10))
     except KeyboardInterrupt:
         print("Stopped log simulation.")
     finally:

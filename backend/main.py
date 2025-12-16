@@ -16,13 +16,41 @@ from fastapi.middleware.gzip import GZipMiddleware
 from dotenv import load_dotenv
 import os
 import logging
+from dateutil import parser
+# Logging configuration
+import logging
+from logging.handlers import RotatingFileHandler
+import os
+import time
+from functools import lru_cache
+from datetime import timedelta
 
-# Setup detailed logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+
+# Ensure a logs directory exists
+os.makedirs("logs", exist_ok=True)
+
+# Setup rotating file handler
+log_file = "logs/backend_debug.log"
+file_handler = RotatingFileHandler(log_file, maxBytes=5_000_000, backupCount=3)
+console_handler = logging.StreamHandler()
+
+# Formatter
+formatter = logging.Formatter(
+    "%(asctime)s - %(levelname)s - %(name)s - %(message)s"
 )
-logger = logging.getLogger(__name__)
+file_handler.setFormatter(formatter)
+console_handler.setFormatter(formatter)
+
+# Root logger setup
+logger = logging.getLogger("cryptosecure")
+logger.setLevel(logging.DEBUG)  # captures debug, info, warning, error
+logger.addHandler(file_handler)
+logger.addHandler(console_handler)
+
+cache_storage = {}
+CACHE_TTL = 120  # Cache for 120 seconds (increased from 30 for better hit rate)
+def cache_key(interval: str, since_time: str) -> str:
+    return f"{interval}:{since_time}"
 
 # FIXED: Only create FastAPI app once
 app = FastAPI(title="CryptoSecure Logs API", version="1.0.0")
@@ -134,12 +162,12 @@ async def get_logs(
             time_filter["$lte"] = end_dt
         query["timestamp"] = time_filter
 
-    logger.info(f"🔍 MongoDB query: {query}")
+    logger.info(f"MongoDB query: {query}")
 
     # Validate sorting
     allowed_sort_fields = {"timestamp", "level", "_id"}
     if sort_by not in allowed_sort_fields:
-        logger.error(f"❌ Invalid sort field: {sort_by}")
+        logger.error(f"Invalid sort field: {sort_by}")
         raise HTTPException(status_code=400, detail=f"Invalid sort_by field. Choose from {allowed_sort_fields}")
     sort_direction = 1 if sort_order == "asc" else -1
 
@@ -244,13 +272,22 @@ def get_kafka_consumer():
 async def save_log(log):
     try:
         if collection is not None:
+            # Convert timestamp string to datetime object for proper MongoDB storage
+            if "timestamp" in log and isinstance(log["timestamp"], str):
+                try:
+                    log["timestamp"] = datetime.fromisoformat(log["timestamp"])
+                    logger.debug(f"✅ Converted timestamp to datetime: {log['timestamp']}")
+                except (ValueError, TypeError) as e:
+                    logger.error(f"❌ Failed to parse timestamp '{log['timestamp']}': {e}")
+                    # Keep original if parsing fails
+            
             result = await collection.insert_one(log)
             logger.info(f"💾 Saved log with id: {result.inserted_id}")
             logger.debug(f"📄 Log content: {log}")
         else:
             logger.error("❌ Cannot save log: collection not available")
     except Exception as e:
-        logger.error(f"❌ Error saving log to MongoDB: {e}")
+        logger.error(f"Error saving log to MongoDB: {e}")
 
 async def consume_and_store():
     try:
@@ -303,14 +340,49 @@ async def startup_event():
             try:
                 doc_count = await collection.count_documents({})
                 logger.info(f"📊 Collection '{COLLECTION_NAME}' has {doc_count} documents")
-            except Exception as e:
-                logger.warning(f"⚠️ Could not get collection stats: {e}")
+                logger.info("🔧 Ensuring MongoDB indexes...")
                 
+                # CREATE OPTIMIZED COMPOUND INDEXES FOR ANALYTICS PERFORMANCE
+                await collection.create_index([("timestamp", 1)])
+                logger.info("✅ Index on 'timestamp' created")
+                
+                # Critical compound index for aggregation queries
+                await collection.create_index([("timestamp", 1), ("level", 1)])
+                logger.info("✅ Index on 'timestamp ASC, level' created (CRITICAL for analytics)")
+                
+                # Additional optimized indexes
+                await collection.create_index([("timestamp", -1), ("level", 1)])
+                logger.info("✅ Index on 'timestamp DESC, level' created")
+                
+                await collection.create_index([("host", 1), ("timestamp", 1)])
+                logger.info("✅ Index on 'host, timestamp' created")
+                
+                # Single field indexes
+                await collection.create_index([("level", 1)])
+                logger.info("✅ Index on 'level' created")
+                
+                await collection.create_index([("host", 1)])
+                logger.info("✅ Index on 'host' created")
+                
+                await collection.create_index([("event", "text")])
+                logger.info("✅ Text index on 'event' created")
+                
+            except Exception as e:
+                logger.warning(f"⚠️ Could not create indexes: {e}")
         else:
             logger.warning("⚠️ MONGO_URI not found in environment")
     except Exception as e:
         logger.error(f"❌ MongoDB connection failed: {e}")
         # Don't fail startup, just log the error
+    
+    # Pre-warm analytics cache for common intervals
+    logger.info("🔥 Pre-warming analytics cache...")
+    try:
+        for interval in ["day", "hour", "week"]:
+            await get_analytics(interval=interval)
+            logger.info(f"✅ Pre-warmed cache for interval={interval}")
+    except Exception as e:
+        logger.warning(f"⚠️ Cache warmup failed: {e}")
     
     # Start Kafka consumer if explicitly enabled
     enable_kafka = os.getenv("ENABLE_KAFKA", "false").lower()
@@ -327,6 +399,7 @@ async def startup_event():
         logger.info("📡 Kafka consumer disabled (set ENABLE_KAFKA=true to enable)")
     
     logger.info("🎉 Startup completed!")
+
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -362,24 +435,406 @@ async def debug_env():
         "environment_vars": list(os.environ.keys())  # Just the keys, not values for security
     }
 
-# Kafka management endpoints
-@app.post("/kafka/start")
-async def start_kafka_consumer():
-    global consumer_task
-    logger.info("📥 Start Kafka consumer endpoint called")
+@app.get("/logs/stats/by-level")
+async def get_stats_by_level():
+    """Get count of logs grouped by level"""
+    logger.info("📥 Get stats by level endpoint called")
     
-    if consumer_task and not consumer_task.done():
-        logger.warning("⚠️ Kafka consumer is already running")
-        return {"status": "error", "message": "Kafka consumer is already running"}
+    if collection is None:
+        logger.error("❌ Database collection not available")
+        raise HTTPException(status_code=503, detail="Database not available")
     
     try:
-        logger.info("🚀 Starting Kafka consumer via API...")
-        consumer_task = asyncio.create_task(consume_and_store())
-        logger.info("✅ Kafka consumer started successfully!")
-        return {"status": "success", "message": "Kafka consumer started"}
+        pipeline = [
+            {
+                "$group": {
+                    "_id": "$level",
+                    "count": {"$sum": 1}
+                }
+            },
+            {
+                "$sort": {"count": -1}
+            }
+        ]
+        
+        results = await collection.aggregate(pipeline).to_list(length=None)
+        stats = [{"level": item["_id"], "count": item["count"]} for item in results]
+        
+        logger.info(f"✅ Retrieved stats for {len(stats)} levels")
+        return {"stats": stats}
     except Exception as e:
-        logger.error(f"❌ Failed to start Kafka consumer: {e}")
-        return {"status": "error", "message": f"Failed to start Kafka consumer: {str(e)}"}
+        logger.error(f"❌ Error getting level stats: {e}")
+        raise HTTPException(status_code=500, detail=f"Stats query error: {str(e)}")
+
+
+@app.get("/logs/stats/over-time")
+async def get_stats_over_time(
+    hours: int = Query(default=24, description="Number of hours to look back"),
+    interval: str = Query(default="hour", description="Grouping interval: hour or day")
+):
+    """Get log counts over time"""
+    logger.info(f"📥 Get stats over time endpoint called: hours={hours}, interval={interval}")
+    
+    if collection is None:
+        logger.error("❌ Database collection not available")
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    try:
+        cutoff_time = datetime.utcnow() - timedelta(hours=hours)
+        
+        # Determine grouping format based on interval
+        if interval == "hour":
+            date_format = "%Y-%m-%d %H:00"
+        else:
+            date_format = "%Y-%m-%d"
+        
+        pipeline = [
+            {
+                "$match": {
+                    "timestamp": {"$gte": cutoff_time}
+                }
+            },
+            {
+                "$group": {
+                    "_id": {
+                        "time": {
+                            "$dateToString": {
+                                "format": date_format,
+                                "date": "$timestamp"
+                            }
+                        },
+                        "level": "$level"
+                    },
+                    "count": {"$sum": 1}
+                }
+            },
+            {
+                "$sort": {"_id.time": 1}
+            }
+        ]
+        
+        results = await collection.aggregate(pipeline).to_list(length=None)
+        
+        time_series = {}
+        for item in results:
+            time = item["_id"]["time"]
+            level = item["_id"]["level"]
+            count = item["count"]
+            
+            if time not in time_series:
+                time_series[time] = {"time": time, "INFO": 0, "WARNING": 0, "ERROR": 0}
+            
+            time_series[time][level] = count
+        
+        logger.info(f"✅ Retrieved time series data with {len(time_series)} time points")
+        return {"data": list(time_series.values())}
+    except Exception as e:
+        logger.error(f"❌ Error getting time series stats: {e}")
+        raise HTTPException(status_code=500, detail=f"Stats query error: {str(e)}")
+
+
+@app.get("/logs/stats/top-events")
+async def get_top_events(limit: int = Query(default=10, description="Number of top events to return")):
+    """Get most common events"""
+    logger.info(f"📥 Get top events endpoint called: limit={limit}")
+    
+    if collection is None:
+        logger.error("❌ Database collection not available")
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    try:
+        pipeline = [
+            {
+                "$group": {
+                    "_id": "$event",
+                    "count": {"$sum": 1}
+                }
+            },
+            {
+                "$sort": {"count": -1}
+            },
+            {
+                "$limit": limit
+            }
+        ]
+        
+        results = await collection.aggregate(pipeline).to_list(length=None)
+        events = [{"event": item["_id"], "count": item["count"]} for item in results]
+        
+        logger.info(f"✅ Retrieved top {len(events)} events")
+        return {"events": events}
+    except Exception as e:
+        logger.error(f"❌ Error getting top events: {e}")
+        raise HTTPException(status_code=500, detail=f"Stats query error: {str(e)}")
+
+
+@app.get("/logs/stats/summary")
+async def get_summary_stats():
+    """Get overall summary statistics"""
+    logger.info("📥 Get summary stats endpoint called")
+    
+    if collection is None:
+        logger.error("❌ Database collection not available")
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    try:
+        total_logs = await collection.count_documents({})
+        
+        # Count by level
+        info_count = await collection.count_documents({"level": "INFO"})
+        warning_count = await collection.count_documents({"level": "WARNING"})
+        error_count = await collection.count_documents({"level": "ERROR"})
+        
+        # Recent logs (last 24 hours)
+        cutoff_time = datetime.utcnow() - timedelta(hours=24)
+        recent_logs = await collection.count_documents({"timestamp": {"$gte": cutoff_time}})
+        recent_errors = await collection.count_documents({
+            "timestamp": {"$gte": cutoff_time},
+            "level": "ERROR"
+        })
+        
+        # Calculate error rate
+        error_rate = (error_count / total_logs * 100) if total_logs > 0 else 0
+        recent_error_rate = (recent_errors / recent_logs * 100) if recent_logs > 0 else 0
+        
+        logger.info(f"✅ Summary stats calculated: {total_logs} total logs, {error_rate:.2f}% error rate")
+        
+        return {
+            "total_logs": total_logs,
+            "info_count": info_count,
+            "warning_count": warning_count,
+            "error_count": error_count,
+            "error_rate": round(error_rate, 2),
+            "recent_logs_24h": recent_logs,
+            "recent_errors_24h": recent_errors,
+            "recent_error_rate": round(recent_error_rate, 2)
+        }
+    except Exception as e:
+        logger.error(f"❌ Error getting summary stats: {e}")
+        raise HTTPException(status_code=500, detail=f"Stats query error: {str(e)}")
+
+
+@app.get("/logs/stats/by-host")
+async def get_stats_by_host(limit: int = Query(default=10, description="Number of top hosts to return")):
+    """Get log counts grouped by host"""
+    logger.info(f"📥 Get stats by host endpoint called: limit={limit}")
+    
+    if collection is None:
+        logger.error("❌ Database collection not available")
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    try:
+        pipeline = [
+            {
+                "$group": {
+                    "_id": "$host",
+                    "total": {"$sum": 1},
+                    "errors": {
+                        "$sum": {
+                            "$cond": [{"$eq": ["$level", "ERROR"]}, 1, 0]
+                        }
+                    }
+                }
+            },
+            {
+                "$sort": {"total": -1}
+            },
+            {
+                "$limit": limit
+            }
+        ]
+        
+        results = await collection.aggregate(pipeline).to_list(length=None)
+        
+        hosts = [
+            {
+                "host": item["_id"],
+                "total": item["total"],
+                "errors": item["errors"]
+            }
+            for item in results
+        ]
+        
+        logger.info(f"✅ Retrieved stats for {len(hosts)} hosts")
+        return {"hosts": hosts}
+    except Exception as e:
+        logger.error(f"❌ Error getting host stats: {e}")
+        raise HTTPException(status_code=500, detail=f"Stats query error: {str(e)}")
+    
+@app.get("/api/analytics")
+async def get_analytics(interval: str = Query("24h", regex="^(15min|1h|24h|7d)$")):
+    """
+    Returns analytics data aggregated by time interval with detailed timing.
+    """
+    logger.info(f"📥 /api/analytics called: interval={interval}")
+
+    if collection is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    # TIMING: Total request
+    total_start = time.time()
+    
+    now = datetime.utcnow()
+    delta = {
+        "15min": timedelta(minutes=15),
+        "1h": timedelta(hours=1),
+        "24h": timedelta(hours=24),
+        "7d": timedelta(days=7),
+    }[interval]
+    since = now - delta
+
+    # TIMING: Cache check
+    cache_start = time.time()
+    cache_id = cache_key(interval, since.isoformat())
+    if cache_id in cache_storage:
+        cached_data, cached_time = cache_storage[cache_id]
+        if time.time() - cached_time < CACHE_TTL:
+            cache_elapsed = time.time() - cache_start
+            logger.info(f"✅ CACHE HIT in {cache_elapsed:.3f}s")
+            return cached_data
+    cache_elapsed = time.time() - cache_start
+    logger.info(f"⏭️ Cache miss ({cache_elapsed:.3f}s), running aggregation...")
+
+    # TIMING: Count documents
+    count_start = time.time()
+    total_docs = await collection.count_documents({"timestamp": {"$gte": since}})
+    count_elapsed = time.time() - count_start
+    logger.info(f"📊 Found {total_docs} documents matching filter in {count_elapsed:.3f}s")
+
+    # TIMING: Aggregation pipeline
+    agg_start = time.time()
+    
+    time_expr = {}
+    if interval == "15min":
+        # Group by 5-minute windows for better granularity
+        time_expr = {
+            "$dateToString": {
+                "format": "%Y-%m-%d %H:%M",
+                "date": "$timestamp"
+            }
+        }
+    elif interval == "1h":
+        # Group by 10-minute windows
+        time_expr = {
+            "$dateToString": {
+                "format": "%Y-%m-%d %H:%M",
+                "date": "$timestamp"
+            }
+        }
+    elif interval == "24h":
+        # Group by hour for 24 hours = 24 data points
+        time_expr = {
+            "$dateToString": {
+                "format": "%Y-%m-%d %H:00",
+                "date": "$timestamp"
+            }
+        }
+    elif interval == "7d":
+        # Group by day for 7 days = 7 data points
+        time_expr = {
+            "$dateToString": {
+                "format": "%Y-%m-%d",
+                "date": "$timestamp"
+            }
+        }
+
+    pipeline = [
+        {"$match": {"timestamp": {"$gte": since}}},
+        {
+            "$group": {
+                "_id": {
+                    "time": time_expr,
+                    "level": "$level"
+                },
+                "count": {"$sum": 1}
+            }
+        },
+        {"$sort": {"_id.time": 1}}
+    ]
+
+    results = await collection.aggregate(pipeline).to_list(length=None)
+    agg_elapsed = time.time() - agg_start
+    logger.info(f"⏱️ Aggregation pipeline completed in {agg_elapsed:.3f}s")
+
+    if not results:
+        logger.warning("⚠️ No logs found for analytics")
+        return {"chartData": [], "pieData": [], "totalLogs": 0}
+
+    # TIMING: Data formatting
+    format_start = time.time()
+    
+    # Format results (single-pass aggregation)
+    chart_data = []
+    severity_counts = {}
+    total_logs = sum(item["count"] for item in results)
+
+    for item in results:
+        raw_time = item["_id"]["time"]
+        count = item["count"]
+        level = item["_id"]["level"]
+
+        # Format time labels based on interval
+        if interval == "15min":
+            # Format: HH:MM
+            dt = datetime.fromisoformat(raw_time)
+            label = dt.strftime("%H:%M")
+            sort_key = dt.timestamp()
+        elif interval == "1h":
+            # Format: HH:MM
+            dt = datetime.fromisoformat(raw_time)
+            label = dt.strftime("%H:%M")
+            sort_key = dt.timestamp()
+        elif interval == "24h":
+            # Format: HH:00 (hourly)
+            dt = datetime.fromisoformat(raw_time + ":00")  # Append :00 for datetime parsing
+            label = dt.strftime("%H:00")
+            sort_key = dt.timestamp()
+        elif interval == "7d":
+            # Format: YYYY-MM-DD (daily)
+            dt = datetime.fromisoformat(raw_time)
+            label = dt.strftime("%a %m/%d")
+            sort_key = dt.timestamp()
+
+        # Find or create chart entry for this time period
+        existing_entry = next((e for e in chart_data if e["sort_key"] == sort_key), None)
+        if existing_entry:
+            existing_entry["requests"] += count
+            existing_entry["alerts"] = max(1, existing_entry["requests"] // 10)
+        else:
+            chart_data.append({
+                "label": label,
+                "requests": count,
+                "alerts": max(1, count // 10),
+                "sort_key": sort_key,
+            })
+
+        # Track severity counts
+        severity_counts[level] = severity_counts.get(level, 0) + count
+
+    chart_data_sorted = sorted(chart_data, key=lambda x: x["sort_key"])
+    pie_data = [{"name": lvl, "value": cnt} for lvl, cnt in severity_counts.items() if cnt > 0]
+
+    response = {
+        "chartData": [
+            {"name": item["label"], "requests": item["requests"], "alerts": item["alerts"]}
+            for item in chart_data_sorted
+        ],
+        "pieData": pie_data,
+        "totalLogs": total_logs
+    }
+
+    format_elapsed = time.time() - format_start
+    logger.info(f"📝 Data formatting completed in {format_elapsed:.3f}s")
+    
+    # Cache the response
+    cache_storage[cache_id] = (response, time.time())
+
+    # TOTAL TIMING
+    total_elapsed = time.time() - total_start
+    logger.info(f"🎯 TOTAL /api/analytics completed in {total_elapsed:.3f}s")
+    logger.info(f"   Breakdown: count={count_elapsed:.3f}s, agg={agg_elapsed:.3f}s, format={format_elapsed:.3f}s")
+
+    return response
 
 @app.post("/kafka/stop")
 async def stop_kafka_consumer():
