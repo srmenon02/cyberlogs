@@ -7,7 +7,7 @@ import {
 const COLORS = ["#ef4444", "#f59e0b", "#3b82f6", "#10b981"]; // red, amber, blue, green
 const INTERVALS = [
   { value: "15min", label: "15 minutes" },
-  { value: "1h", label: "1 Hhur" },
+  { value: "1h", label: "1 Hour" },
   { value: "24h", label: "24 hours" },
   { value: "7d", label: "7 days" }
 ];
