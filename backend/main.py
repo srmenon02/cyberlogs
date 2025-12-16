@@ -272,6 +272,15 @@ def get_kafka_consumer():
 async def save_log(log):
     try:
         if collection is not None:
+            # Convert timestamp string to datetime object for proper MongoDB storage
+            if "timestamp" in log and isinstance(log["timestamp"], str):
+                try:
+                    log["timestamp"] = datetime.fromisoformat(log["timestamp"])
+                    logger.debug(f"✅ Converted timestamp to datetime: {log['timestamp']}")
+                except (ValueError, TypeError) as e:
+                    logger.error(f"❌ Failed to parse timestamp '{log['timestamp']}': {e}")
+                    # Keep original if parsing fails
+            
             result = await collection.insert_one(log)
             logger.info(f"💾 Saved log with id: {result.inserted_id}")
             logger.debug(f"📄 Log content: {log}")
@@ -506,7 +515,6 @@ async def get_stats_over_time(
         
         results = await collection.aggregate(pipeline).to_list(length=None)
         
-        # Transform data for easier frontend consumption
         time_series = {}
         for item in results:
             time = item["_id"]["time"]
@@ -654,7 +662,7 @@ async def get_stats_by_host(limit: int = Query(default=10, description="Number o
         raise HTTPException(status_code=500, detail=f"Stats query error: {str(e)}")
     
 @app.get("/api/analytics")
-async def get_analytics(interval: str = Query("day", regex="^(year|month|week|day|hour)$")):
+async def get_analytics(interval: str = Query("24h", regex="^(15min|1h|24h|7d)$")):
     """
     Returns analytics data aggregated by time interval with detailed timing.
     """
@@ -668,11 +676,10 @@ async def get_analytics(interval: str = Query("day", regex="^(year|month|week|da
     
     now = datetime.utcnow()
     delta = {
-        "year": timedelta(days=365),
-        "month": timedelta(days=30),
-        "week": timedelta(days=7),
-        "day": timedelta(days=1),
-        "hour": timedelta(hours=24),
+        "15min": timedelta(minutes=15),
+        "1h": timedelta(hours=1),
+        "24h": timedelta(hours=24),
+        "7d": timedelta(days=7),
     }[interval]
     since = now - delta
 
@@ -690,7 +697,7 @@ async def get_analytics(interval: str = Query("day", regex="^(year|month|week|da
 
     # TIMING: Count documents
     count_start = time.time()
-    total_docs = await collection.count_documents({"timestamp": {"$gte": since.isoformat()}})
+    total_docs = await collection.count_documents({"timestamp": {"$gte": since}})
     count_elapsed = time.time() - count_start
     logger.info(f"📊 Found {total_docs} documents matching filter in {count_elapsed:.3f}s")
 
@@ -698,24 +705,41 @@ async def get_analytics(interval: str = Query("day", regex="^(year|month|week|da
     agg_start = time.time()
     
     time_expr = {}
-    if interval == "year":
-        time_expr = {"$year": {"$toDate": "$timestamp"}}
-    elif interval == "month":
-        time_expr = {"$month": {"$toDate": "$timestamp"}}
-    elif interval == "week":
-        time_expr = {"$isoWeek": {"$toDate": "$timestamp"}}
-    elif interval == "day":
+    if interval == "15min":
+        # Group by 5-minute windows for better granularity
+        time_expr = {
+            "$dateToString": {
+                "format": "%Y-%m-%d %H:%M",
+                "date": "$timestamp"
+            }
+        }
+    elif interval == "1h":
+        # Group by 10-minute windows
+        time_expr = {
+            "$dateToString": {
+                "format": "%Y-%m-%d %H:%M",
+                "date": "$timestamp"
+            }
+        }
+    elif interval == "24h":
+        # Group by hour for 24 hours = 24 data points
+        time_expr = {
+            "$dateToString": {
+                "format": "%Y-%m-%d %H:00",
+                "date": "$timestamp"
+            }
+        }
+    elif interval == "7d":
+        # Group by day for 7 days = 7 data points
         time_expr = {
             "$dateToString": {
                 "format": "%Y-%m-%d",
-                "date": {"$toDate": "$timestamp"}
+                "date": "$timestamp"
             }
         }
-    elif interval == "hour":
-        time_expr = {"$hour": {"$toDate": "$timestamp"}}
 
     pipeline = [
-        {"$match": {"timestamp": {"$gte": since.isoformat()}}},
+        {"$match": {"timestamp": {"$gte": since}}},
         {
             "$group": {
                 "_id": {
@@ -750,25 +774,26 @@ async def get_analytics(interval: str = Query("day", regex="^(year|month|week|da
         level = item["_id"]["level"]
 
         # Format time labels based on interval
-        if interval == "hour":
-            dt = datetime(now.year, now.month, now.day, int(raw_time))
-            label = dt.strftime("%-I:00 %p")
-            sort_key = int(raw_time)
-        elif interval == "day":
+        if interval == "15min":
+            # Format: HH:MM
             dt = datetime.fromisoformat(raw_time)
-            label = dt.strftime("%A %B %-d")
+            label = dt.strftime("%H:%M")
             sort_key = dt.timestamp()
-        elif interval == "week":
-            dt = datetime.fromisocalendar(now.year, int(raw_time), 1)
-            label = dt.strftime("%m/%d")
+        elif interval == "1h":
+            # Format: HH:MM
+            dt = datetime.fromisoformat(raw_time)
+            label = dt.strftime("%H:%M")
             sort_key = dt.timestamp()
-        elif interval == "month":
-            dt = datetime(now.year, int(raw_time), 1)
-            label = dt.strftime("%b")
-            sort_key = int(raw_time)
-        elif interval == "year":
-            label = str(raw_time)
-            sort_key = int(raw_time)
+        elif interval == "24h":
+            # Format: HH:00 (hourly)
+            dt = datetime.fromisoformat(raw_time + ":00")  # Append :00 for datetime parsing
+            label = dt.strftime("%H:00")
+            sort_key = dt.timestamp()
+        elif interval == "7d":
+            # Format: YYYY-MM-DD (daily)
+            dt = datetime.fromisoformat(raw_time)
+            label = dt.strftime("%a %m/%d")
+            sort_key = dt.timestamp()
 
         # Find or create chart entry for this time period
         existing_entry = next((e for e in chart_data if e["sort_key"] == sort_key), None)

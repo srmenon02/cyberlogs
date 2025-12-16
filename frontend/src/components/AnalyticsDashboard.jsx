@@ -5,7 +5,12 @@ import {
 } from "recharts";
 
 const COLORS = ["#ef4444", "#f59e0b", "#3b82f6", "#10b981"]; // red, amber, blue, green
-const INTERVALS = ["year", "month", "week", "day", "hour"];
+const INTERVALS = [
+  { value: "15min", label: "15 minutes" },
+  { value: "1h", label: "1 Hhur" },
+  { value: "24h", label: "24 hours" },
+  { value: "7d", label: "7 days" }
+];
 
 // Frontend cache for analytics (TTL: 60 seconds)
 const analyticsCache = new Map();
@@ -15,7 +20,7 @@ export default function AnalyticsDashboard() {
   const [chartData, setChartData] = useState([]);
   const [pieData, setPieData] = useState([]);
   const [loading, setLoading] = useState(true);
-  const [interval, setInterval] = useState("day"); // default interval
+  const [interval, setInterval] = useState("15min"); // default interval
   const debounceTimer = useRef(null);
   const [cacheStatus, setCacheStatus] = useState(""); // For debugging
 
@@ -98,15 +103,15 @@ export default function AnalyticsDashboard() {
     <div className="p-6 grid grid-cols-1 gap-6 text-gray-200">
       {/* Interval selector */}
       <div className="mb-4 flex gap-2 items-center">
-        <span className="text-gray-400 font-semibold">Timeframe:</span>
+        <span className="text-gray-400 font-semibold">Show Logs over the last:</span>
         <select
           value={interval}
           onChange={(e) => handleIntervalChange(e.target.value)}
           className="bg-charcoal-700 text-gray-200 px-3 py-1 rounded-lg"
         >
           {INTERVALS.map((intv) => (
-            <option key={intv} value={intv}>
-              {intv.charAt(0).toUpperCase() + intv.slice(1)}
+            <option key={intv.value} value={intv.value}>
+              {intv.label}
             </option>
           ))}
         </select>
